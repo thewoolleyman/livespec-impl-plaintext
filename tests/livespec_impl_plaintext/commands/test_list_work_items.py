@@ -1,0 +1,229 @@
+"""Tests for the list-work-items thin-transport command."""
+
+import json
+from pathlib import Path
+
+import pytest
+from livespec_impl_plaintext.commands.list_work_items import main
+from livespec_impl_plaintext.store import append_work_item
+from livespec_impl_plaintext.types import AuditRecord, WorkItem
+
+
+def _item(
+    *,
+    id_: str,
+    status: str = "open",
+    origin: str = "freeform",
+    gap_id: str | None = None,
+    depends_on: tuple[str, ...] = (),
+    priority: int = 2,
+) -> WorkItem:
+    return WorkItem(
+        id=id_,
+        type="task",
+        status=status,  # type: ignore[arg-type]
+        title=f"{id_} title",
+        description="d",
+        origin=origin,  # type: ignore[arg-type]
+        gap_id=gap_id,
+        priority=priority,
+        assignee=None,
+        depends_on=depends_on,
+        captured_at="2026-05-19T00:00:00Z",
+        resolution="fix" if status == "closed" else None,
+        reason="done" if status == "closed" else None,
+        audit=AuditRecord(
+            verification_timestamp="2026-05-19T01:00:00Z",
+            commits=("c",),
+            files_changed=("f",),
+        )
+        if status == "closed"
+        else None,
+        superseded_by=None,
+    )
+
+
+def test_main_missing_store_prints_no_items(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    rc = main([])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "(no work-items)" in captured.out
+
+
+def test_main_lists_all_human(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "work-items.jsonl"
+    append_work_item(path=path, item=_item(id_="li-a", origin="gap-tied", gap_id="G1"))
+    append_work_item(path=path, item=_item(id_="li-b"))
+    rc = main([])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "li-a" in captured.out
+    assert "li-b" in captured.out
+    assert "gap=G1" in captured.out
+
+
+def test_main_filter_gap_tied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "work-items.jsonl"
+    append_work_item(path=path, item=_item(id_="li-a", origin="gap-tied", gap_id="G1"))
+    append_work_item(path=path, item=_item(id_="li-b"))
+    rc = main(["--filter=gap-tied"])
+    captured = capsys.readouterr()
+    assert "li-a" in captured.out
+    assert "li-b" not in captured.out
+    assert rc == 0
+
+
+def test_main_filter_freeform(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "work-items.jsonl"
+    append_work_item(path=path, item=_item(id_="li-a", origin="gap-tied", gap_id="G1"))
+    append_work_item(path=path, item=_item(id_="li-b"))
+    rc = main(["--filter=freeform"])
+    captured = capsys.readouterr()
+    assert "li-b" in captured.out
+    assert "li-a" not in captured.out
+    assert rc == 0
+
+
+def test_main_filter_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "work-items.jsonl"
+    append_work_item(path=path, item=_item(id_="li-a", status="blocked"))
+    append_work_item(path=path, item=_item(id_="li-b"))
+    rc = main(["--filter=blocked"])
+    captured = capsys.readouterr()
+    assert "li-a" in captured.out
+    assert "li-b" not in captured.out
+    assert rc == 0
+
+
+def test_main_filter_ready_excludes_unresolved_deps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "work-items.jsonl"
+    append_work_item(path=path, item=_item(id_="li-a"))
+    append_work_item(path=path, item=_item(id_="li-b", depends_on=("li-a",)))
+    append_work_item(path=path, item=_item(id_="li-c", depends_on=("li-missing",)))
+    rc = main(["--filter=ready"])
+    captured = capsys.readouterr()
+    assert "li-a" in captured.out
+    assert "li-b" not in captured.out
+    assert "li-c" not in captured.out
+    assert rc == 0
+
+
+def test_main_filter_ready_includes_closed_deps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "work-items.jsonl"
+    append_work_item(path=path, item=_item(id_="li-a", status="closed"))
+    append_work_item(path=path, item=_item(id_="li-b", depends_on=("li-a",)))
+    rc = main(["--filter=ready"])
+    captured = capsys.readouterr()
+    assert "li-b" in captured.out
+    assert rc == 0
+
+
+def test_main_filter_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "work-items.jsonl"
+    append_work_item(path=path, item=_item(id_="li-a"))
+    append_work_item(path=path, item=_item(id_="li-b", status="closed"))
+    rc = main(["--filter=closed"])
+    captured = capsys.readouterr()
+    assert "li-b" in captured.out
+    assert "li-a" not in captured.out
+    assert rc == 0
+
+
+def test_main_with_gap_id_filter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "work-items.jsonl"
+    append_work_item(path=path, item=_item(id_="li-a", origin="gap-tied", gap_id="G1"))
+    append_work_item(path=path, item=_item(id_="li-b", origin="gap-tied", gap_id="G2"))
+    rc = main(["--with-gap-id", "G1"])
+    captured = capsys.readouterr()
+    assert "li-a" in captured.out
+    assert "li-b" not in captured.out
+    assert rc == 0
+
+
+def test_main_json_output_with_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "work-items.jsonl"
+    append_work_item(path=path, item=_item(id_="li-a", status="closed"))
+    rc = main(["--json"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    payload = json.loads(captured.out)
+    assert payload[0]["id"] == "li-a"
+    assert payload[0]["audit"]["commits"] == ["c"]
+
+
+def test_main_json_output_without_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "work-items.jsonl"
+    append_work_item(path=path, item=_item(id_="li-open"))
+    rc = main(["--json"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    payload = json.loads(captured.out)
+    assert payload[0]["id"] == "li-open"
+    assert payload[0]["audit"] is None
+
+
+def test_main_with_custom_work_items_path(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "custom-work-items.jsonl"
+    append_work_item(path=path, item=_item(id_="li-a"))
+    rc = main(["--work-items-path", str(path)])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "li-a" in captured.out
