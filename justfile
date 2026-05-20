@@ -41,6 +41,15 @@ bootstrap:
     cp dev-tooling/git-hook-wrapper.sh .git/hooks/pre-push
     cp dev-tooling/git-hook-wrapper.sh .git/hooks/commit-msg
     chmod +x .git/hooks/pre-commit .git/hooks/pre-push .git/hooks/commit-msg
+    just ensure-plugins
+
+# Idempotent: `claude plugin marketplace add` and `claude plugin install`
+# both exit 0 when the target is already present.
+ensure-plugins:
+    claude plugin marketplace add thewoolleyman/livespec
+    claude plugin marketplace add thewoolleyman/livespec-impl-plaintext
+    claude plugin install livespec@livespec
+    claude plugin install livespec-impl-plaintext@livespec-impl-plaintext
 
 # ---------------------------------------------------------------
 # Aggregate check — tool-backed targets only. Add dev-tooling-
