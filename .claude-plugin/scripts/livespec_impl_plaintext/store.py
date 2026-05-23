@@ -91,13 +91,30 @@ def read_memos(*, path: Path) -> Iterator[Memo]:
 
 
 def append_work_item(*, path: Path, item: WorkItem) -> None:
-    """Append a single WorkItem as a new line in the JSONL file."""
-    _append_record(path=path, payload=_work_item_to_dict(item=item))
+    """Append a single WorkItem as a new line in the JSONL file.
+
+    Validates the dict-serialized payload against the same schema the
+    read path enforces before writing; raises SchemaViolationError when
+    the payload would not round-trip through `read_work_items`. The
+    write is symmetric with the read so a record landing on disk is
+    guaranteed to parse back cleanly.
+    """
+    payload = _work_item_to_dict(item=item)
+    _validate_work_item_payload(path=path, line_number=0, parsed=payload)
+    _append_record(path=path, payload=payload)
 
 
 def append_memo(*, path: Path, memo: Memo) -> None:
-    """Append a single Memo as a new line in the JSONL file."""
-    _append_record(path=path, payload=_memo_to_dict(memo=memo))
+    """Append a single Memo as a new line in the JSONL file.
+
+    Validates the dict-serialized payload against the same schema the
+    read path enforces before writing; raises SchemaViolationError when
+    the payload would not round-trip through `read_memos`. Same write
+    symmetry as `append_work_item`.
+    """
+    payload = _memo_to_dict(memo=memo)
+    _validate_memo_payload(path=path, line_number=0, parsed=payload)
+    _append_record(path=path, payload=payload)
 
 
 def materialize_work_items(records: Iterator[WorkItem]) -> dict[str, WorkItem]:
@@ -149,7 +166,20 @@ def _append_record(*, path: Path, payload: dict[str, Any]) -> None:
         _ = handle.write(line)
 
 
-def _parse_work_item(*, path: Path, line_number: int, parsed: dict[str, Any]) -> WorkItem:
+def _validate_work_item_payload(
+    *,
+    path: Path,
+    line_number: int,
+    parsed: dict[str, Any],
+) -> None:
+    """Verify a work-item dict satisfies the schema contract.
+
+    Shared by the read path (parse) and the write path (append).
+    Raises SchemaViolationError on any deviation; returns None on
+    success. The `line_number=0` sentinel is used by the append path
+    to indicate the validation happened pre-write, not against a
+    specific line on disk.
+    """
     _check_required_keys(
         path=path,
         line_number=line_number,
@@ -187,6 +217,17 @@ def _parse_work_item(*, path: Path, line_number: int, parsed: dict[str, Any]) ->
             allowed=get_args(Resolution),
         )
     audit_value = parsed["audit"]
+    if audit_value is not None:
+        _validate_audit_payload(
+            path=path,
+            line_number=line_number,
+            parsed=audit_value,
+        )
+
+
+def _parse_work_item(*, path: Path, line_number: int, parsed: dict[str, Any]) -> WorkItem:
+    _validate_work_item_payload(path=path, line_number=line_number, parsed=parsed)
+    audit_value = parsed["audit"]
     audit_record = (
         None
         if audit_value is None
@@ -204,14 +245,20 @@ def _parse_work_item(*, path: Path, line_number: int, parsed: dict[str, Any]) ->
         assignee=parsed["assignee"],
         depends_on=tuple(parsed["depends_on"]),
         captured_at=parsed["captured_at"],
-        resolution=resolution_value,
+        resolution=parsed["resolution"],
         reason=parsed["reason"],
         audit=audit_record,
         superseded_by=parsed["superseded_by"],
     )
 
 
-def _parse_audit(*, path: Path, line_number: int, parsed: dict[str, Any]) -> AuditRecord:
+def _validate_audit_payload(
+    *,
+    path: Path,
+    line_number: int,
+    parsed: dict[str, Any],
+) -> None:
+    """Verify an audit sub-object's required keys are present."""
     required = frozenset({"verification_timestamp", "commits", "files_changed"})
     missing = required - parsed.keys()
     if missing:
@@ -220,6 +267,10 @@ def _parse_audit(*, path: Path, line_number: int, parsed: dict[str, Any]) -> Aud
             line_number=line_number,
             detail=f"audit object missing keys: {sorted(missing)}",
         )
+
+
+def _parse_audit(*, path: Path, line_number: int, parsed: dict[str, Any]) -> AuditRecord:
+    _validate_audit_payload(path=path, line_number=line_number, parsed=parsed)
     return AuditRecord(
         verification_timestamp=parsed["verification_timestamp"],
         commits=tuple(parsed["commits"]),
@@ -227,7 +278,16 @@ def _parse_audit(*, path: Path, line_number: int, parsed: dict[str, Any]) -> Aud
     )
 
 
-def _parse_memo(*, path: Path, line_number: int, parsed: dict[str, Any]) -> Memo:
+def _validate_memo_payload(
+    *,
+    path: Path,
+    line_number: int,
+    parsed: dict[str, Any],
+) -> None:
+    """Verify a memo dict satisfies the schema contract.
+
+    Shared by the read path (parse) and the write path (append).
+    """
     _check_required_keys(
         path=path,
         line_number=line_number,
@@ -250,11 +310,15 @@ def _parse_memo(*, path: Path, line_number: int, parsed: dict[str, Any]) -> Memo
             value=disposition_value,
             allowed=get_args(Disposition),
         )
+
+
+def _parse_memo(*, path: Path, line_number: int, parsed: dict[str, Any]) -> Memo:
+    _validate_memo_payload(path=path, line_number=line_number, parsed=parsed)
     return Memo(
         id=parsed["id"],
         text=parsed["text"],
         state=parsed["state"],
-        disposition=disposition_value,
+        disposition=parsed["disposition"],
         captured_at=parsed["captured_at"],
         work_item_id=parsed["work_item_id"],
         knowledge_file=parsed["knowledge_file"],

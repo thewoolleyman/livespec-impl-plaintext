@@ -312,3 +312,99 @@ def test_append_creates_parent_directory(tmp_path: Path) -> None:
     append_work_item(path=path, item=item)
     assert path.exists()
     assert path.parent.is_dir()
+
+
+def test_append_work_item_rejects_bad_enum_status(tmp_path: Path) -> None:
+    path = tmp_path / "work-items.jsonl"
+    bad = _minimal_work_item(status="not-a-real-status")
+    with pytest.raises(SchemaViolationError) as excinfo:
+        append_work_item(path=path, item=bad)
+    assert "status" in excinfo.value.detail
+
+
+def test_append_work_item_rejects_bad_enum_type(tmp_path: Path) -> None:
+    path = tmp_path / "work-items.jsonl"
+    item = WorkItem(
+        id="li-aaa222",
+        type="not-a-real-type",  # type: ignore[arg-type]
+        status="open",
+        title="t",
+        description="d",
+        origin="freeform",
+        gap_id=None,
+        priority=2,
+        assignee=None,
+        depends_on=(),
+        captured_at="2026-05-19T00:00:00Z",
+        resolution=None,
+        reason=None,
+        audit=None,
+        superseded_by=None,
+    )
+    with pytest.raises(SchemaViolationError) as excinfo:
+        append_work_item(path=path, item=item)
+    assert "type" in excinfo.value.detail
+
+
+def test_append_work_item_rejects_bad_enum_origin(tmp_path: Path) -> None:
+    path = tmp_path / "work-items.jsonl"
+    item = WorkItem(
+        id="li-aaa333",
+        type="task",
+        status="open",
+        title="t",
+        description="d",
+        origin="not-a-real-origin",  # type: ignore[arg-type]
+        gap_id=None,
+        priority=2,
+        assignee=None,
+        depends_on=(),
+        captured_at="2026-05-19T00:00:00Z",
+        resolution=None,
+        reason=None,
+        audit=None,
+        superseded_by=None,
+    )
+    with pytest.raises(SchemaViolationError) as excinfo:
+        append_work_item(path=path, item=item)
+    assert "origin" in excinfo.value.detail
+
+
+def test_append_work_item_rejects_bad_enum_resolution(tmp_path: Path) -> None:
+    path = tmp_path / "work-items.jsonl"
+    bad = _minimal_work_item(status="closed", resolution="not-a-real-resolution")
+    with pytest.raises(SchemaViolationError) as excinfo:
+        append_work_item(path=path, item=bad)
+    assert "resolution" in excinfo.value.detail
+
+
+def test_append_work_item_does_not_write_on_validation_failure(tmp_path: Path) -> None:
+    path = tmp_path / "work-items.jsonl"
+    bad = _minimal_work_item(status="not-a-real-status")
+    with pytest.raises(SchemaViolationError):
+        append_work_item(path=path, item=bad)
+    assert not path.exists()
+
+
+def test_append_memo_rejects_bad_enum_state(tmp_path: Path) -> None:
+    path = tmp_path / "memos.jsonl"
+    bad = _minimal_memo(state="not-a-real-state")
+    with pytest.raises(SchemaViolationError) as excinfo:
+        append_memo(path=path, memo=bad)
+    assert "state" in excinfo.value.detail
+
+
+def test_append_memo_rejects_bad_enum_disposition(tmp_path: Path) -> None:
+    path = tmp_path / "memos.jsonl"
+    bad = _minimal_memo(state="dispositioned", disposition="not-a-real-disposition")
+    with pytest.raises(SchemaViolationError) as excinfo:
+        append_memo(path=path, memo=bad)
+    assert "disposition" in excinfo.value.detail
+
+
+def test_append_memo_does_not_write_on_validation_failure(tmp_path: Path) -> None:
+    path = tmp_path / "memos.jsonl"
+    bad = _minimal_memo(state="not-a-real-state")
+    with pytest.raises(SchemaViolationError):
+        append_memo(path=path, memo=bad)
+    assert not path.exists()
