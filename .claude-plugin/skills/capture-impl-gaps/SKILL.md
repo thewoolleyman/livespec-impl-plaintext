@@ -1,6 +1,6 @@
 ---
 name: capture-impl-gaps
-description: Detect spec→impl gaps mechanically via the Spec Reader and file gap-tied work-items into the JSONL store with per-gap user consent. Required heavyweight authored skill per livespec/SPECIFICATION/contracts.md §"Heavyweight authored skills (6)". Invoke as `/livespec-impl-plaintext:capture-impl-gaps`.
+description: Detect spec→impl gaps by invoking the sibling detect-impl-gaps thin-transport skill, then file gap-tied work-items into the JSONL store with per-gap user consent. Required heavyweight authored skill per livespec/SPECIFICATION/contracts.md §"Heavyweight authored skills (6)". Invoke as `/livespec-impl-plaintext:capture-impl-gaps`.
 allowed-tools: Bash, Read, Grep, Glob, Write
 ---
 
@@ -9,8 +9,8 @@ allowed-tools: Bash, Read, Grep, Glob, Write
 Mechanical detection of spec→impl gaps. Heavyweight skill — orchestration
 lives here in the SKILL.md prose per
 SPECIFICATION/constraints.md §"Skill orchestration constraints". The
-plugin's `Spec Reader` adapter and `store` module are the load-bearing
-Python primitives this skill composes.
+plugin's `detect-impl-gaps` thin-transport sibling and `store` module are
+the load-bearing surfaces this skill composes.
 
 ## Pre-requisites
 
@@ -24,28 +24,34 @@ Python primitives this skill composes.
 
 ## Flow
 
-### Step 1 — Enumerate spec rules
+### Step 1 — Enumerate gap candidates via detect-impl-gaps
 
-Read every MUST / SHOULD clause from the canonical spec files using the
-Spec Reader's "read current spec" capability:
+Invoke the sibling thin-transport skill `detect-impl-gaps` to retrieve
+the authoritative gap-id set. Per SPECIFICATION/contracts.md
+§"capture-impl-gaps", both this skill and the doctor invariants consume
+the same canonical surface; in-skill duplication of the detection logic
+is forbidden.
 
-```python
-from livespec_impl_plaintext.spec_reader import read_current_specification
-from pathlib import Path
+Run the skill twice — once with `--json` for the authoritative gap-id
+set, once without for the rich line form used to surface each candidate
+to the user in Step 2:
 
-snapshot = read_current_specification(spec_root=Path("SPECIFICATION"))
+```bash
+# Authoritative gap-id set:
+uv run python3 .claude-plugin/scripts/bin/detect_impl_gaps.py --json
+# → {"gap_ids": ["gap-abc123", "gap-def456", ...]}
+
+# Rich human-readable context for display:
+uv run python3 .claude-plugin/scripts/bin/detect_impl_gaps.py
+# → each line: <spec-file> > <heading-path>  [<gap_id>]  <rule-text>
 ```
 
-For each file in `snapshot.files`, scan for lines matching the rule
-patterns (regex: `\bMUST\b`, `\bMUST NOT\b`, `\bSHOULD\b`, `\bSHOULD
-NOT\b`, and lower-cased variants when in code-block contexts). Each
-match is a candidate rule.
-
-Surface each candidate to the user as a one-line summary:
-
-```
-[<spec-file>:<line>] <rule-text>
-```
+Both invocations use the same canonical `detect_rules` function and
+emit deterministically-sorted output, so the two outputs can be joined
+by `gap_id` to produce a candidate list of
+`(gap_id, spec_file, heading_path, rule_text)` tuples. The `--json`
+form is the authoritative set; the rich form is convenience metadata
+for human display.
 
 ### Step 2 — Per-rule gap classification
 
@@ -59,17 +65,17 @@ For each candidate, ask the user:
 
 ### Step 3 — Per-gap consent + filing
 
-For each `no` rule:
+For each `no` rule, the `gap_id` is already in hand from Step 1 (derived
+inside `detect-impl-gaps` from `<spec-file>\x1f<heading-path>\x1f<rule-text>`
+hashing; shape `gap-<8-char-base32-suffix>`). Then:
 
-1. Derive a stable `gap_id` from the rule location (e.g.,
-   `gap-<spec-file-slug>-<line-number>`).
-2. Check the work-items store: if a record with this `gap_id` already
+1. Check the work-items store: if a record with this `gap_id` already
    exists and is not closed, surface "already filed as `<li-id>`" and
    skip filing.
-3. Otherwise, ask the user to confirm title + description (auto-drafted
+2. Otherwise, ask the user to confirm title + description (auto-drafted
    from the rule text). Defaults are pre-filled; the user accepts or
    edits.
-4. On confirm, append a new work-item JSONL record:
+3. On confirm, append a new work-item JSONL record:
 
 ```python
 from livespec_impl_plaintext._ids import new_work_item_id
@@ -85,7 +91,7 @@ item = WorkItem(
     title=user_confirmed_title,
     description=user_confirmed_description,
     origin="gap-tied",
-    gap_id=stable_gap_id,
+    gap_id=gap_id,
     priority=2,
     assignee=None,
     depends_on=(),
@@ -123,5 +129,6 @@ When all candidates are processed, print a summary:
 ## What this skill does NOT do
 
 - Does NOT close work-items. Use `implement` for that.
-- Does NOT modify the spec tree. Read-only on `<spec-root>/`.
+- Does NOT modify the spec tree (all spec reads are delegated to
+  `detect-impl-gaps`).
 - Does NOT detect impl→spec drift. That's `capture-spec-drift`.
