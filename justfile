@@ -34,24 +34,27 @@ default:
 # ---------------------------------------------------------------
 
 bootstrap:
-    # Idempotent `core.bare = true` on the primary checkout's
+    # Idempotent `livespec.primaryPath` on the primary checkout's
     # git-common-dir config (per livespec/SPECIFICATION/
-    # non-functional-requirements.md §"Bare-flag enforcement" /
-    # §"Bare-flag bootstrap procedure" — family-wide invariant
-    # inherited by every livespec-impl-* sibling). The flag is the
-    # load-bearing setting that forces every edit through
-    # `git worktree add`. Runs FIRST so partial failure of any
-    # later step cannot leave the bare-flag unset. Targets
-    # `git rev-parse --git-common-dir` so the recipe writes the
-    # right file when invoked from the primary checkout AND from
-    # secondary worktrees.
-    git config --file "$(git rev-parse --git-common-dir)/config" core.bare true
-    # Install the git-hook-wrapper that delegates to lefthook via
-    # mise. The wrapper fires regardless of the user's shell config
-    # and routes commit-msg argv[1] to the v034 D3 replay-hook stage.
+    # non-functional-requirements.md §"Primary-checkout commit-refuse
+    # hook" / §"Commit-refuse hook bootstrap procedure" — family-wide
+    # invariant inherited by every livespec-impl-* sibling). The
+    # commit-refuse hook reads this config value to recognize the
+    # primary checkout and refuse commits/pushes there, forcing every
+    # edit through `git worktree add`. Targets the absolute path of
+    # the git common dir's parent so the recipe writes the right
+    # value when invoked from the primary checkout AND from secondary
+    # worktrees.
+    git config --file "$(git rev-parse --git-common-dir)/config" livespec.primaryPath "$(realpath "$(dirname "$(git rev-parse --git-common-dir)")")"
+    # Install the commit-refuse hook (vendored from livespec-dev-
+    # tooling v0.5.0 — see dev-tooling/livespec-commit-refuse-hook.sh)
+    # at pre-commit AND pre-push. Refuses at the primary checkout;
+    # delegates to lefthook at secondary worktrees via mise. The
+    # commit-msg path keeps the legacy git-hook-wrapper since it
+    # routes argv[1] to the v034 D3 replay-hook stage.
     mkdir -p .git/hooks
-    cp dev-tooling/git-hook-wrapper.sh .git/hooks/pre-commit
-    cp dev-tooling/git-hook-wrapper.sh .git/hooks/pre-push
+    cp dev-tooling/livespec-commit-refuse-hook.sh .git/hooks/pre-commit
+    cp dev-tooling/livespec-commit-refuse-hook.sh .git/hooks/pre-push
     cp dev-tooling/git-hook-wrapper.sh .git/hooks/commit-msg
     chmod +x .git/hooks/pre-commit .git/hooks/pre-push .git/hooks/commit-msg
     just ensure-plugins
@@ -113,7 +116,7 @@ check:
         check-no-write-direct
         check-pbt-coverage-pure-modules
         check-per-file-coverage
-        check-primary-checkout-bare-flag-set
+        check-primary-checkout-commit-refuse-hook-installed
         check-private-calls
         check-public-api-result-typed
         check-red-green-replay
@@ -360,13 +363,15 @@ check-per-file-coverage:
     uv run pytest -n auto --cov --cov-branch --cov-config=pyproject.toml --cov-report=term-missing
     uv run python -m livespec_dev_tooling.checks.per_file_coverage
 
-# Family-wide bare-flag invariant per livespec/SPECIFICATION/
-# non-functional-requirements.md §"Bare-flag enforcement". The check
-# is shipped by livespec-dev-tooling (>=v0.3.0); this recipe is the
-# project-root-scoped CI/just-check adoption that the spec mandates
-# for every consumer repo.
-check-primary-checkout-bare-flag-set:
-    uv run python -m livespec_dev_tooling.checks.primary_checkout_bare_flag_set
+# Family-wide commit-refuse hook invariant per livespec/SPECIFICATION/
+# non-functional-requirements.md §"Primary-checkout commit-refuse hook"
+# (v095). Supersedes the v091-v094 bare-flag mechanism, which caused
+# stale-on-disk-read failures at primaries. The check is shipped by
+# livespec-dev-tooling (>=v0.5.0); this recipe is the project-root-
+# scoped CI/just-check adoption that the spec mandates for every
+# consumer repo.
+check-primary-checkout-commit-refuse-hook-installed:
+    uv run python -m livespec_dev_tooling.checks.primary_checkout_commit_refuse_hook_installed
 
 check-private-calls:
     uv run python -m livespec_dev_tooling.checks.private_calls
