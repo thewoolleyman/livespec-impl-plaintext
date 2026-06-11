@@ -1,6 +1,8 @@
 """Tests for the JSONL store primitives."""
 
+import hashlib
 import json
+from itertools import permutations
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +17,12 @@ from livespec_impl_git_jsonl.store import (
     append_work_item,
     materialize_memos,
     materialize_work_items,
+    memo_record_identity,
     read_memos,
     read_work_items,
+    reduce_memo_heads,
+    reduce_work_item_heads,
+    work_item_record_identity,
 )
 from livespec_impl_git_jsonl.types import AuditRecord, Memo, WorkItem
 
@@ -27,6 +33,8 @@ def _minimal_work_item(
     status: str = "open",
     resolution: str | None = None,
     audit: AuditRecord | None = None,
+    captured_at: str = "2026-05-19T00:00:00Z",
+    supersedes: str | None = None,
 ) -> WorkItem:
     return WorkItem(
         id=id_,
@@ -39,11 +47,12 @@ def _minimal_work_item(
         priority=2,
         assignee=None,
         depends_on=(),
-        captured_at="2026-05-19T00:00:00Z",
+        captured_at=captured_at,
         resolution=resolution,  # type: ignore[arg-type]
         reason=None,
         audit=audit,
         superseded_by=None,
+        supersedes=supersedes,
     )
 
 
@@ -52,16 +61,19 @@ def _minimal_memo(
     id_: str = "mm-aaa111",
     state: str = "untriaged",
     disposition: str | None = None,
+    captured_at: str = "2026-05-19T00:00:00Z",
+    supersedes: str | None = None,
 ) -> Memo:
     return Memo(
         id=id_,
         text="some observation",
         state=state,  # type: ignore[arg-type]
         disposition=disposition,  # type: ignore[arg-type]
-        captured_at="2026-05-19T00:00:00Z",
+        captured_at=captured_at,
         work_item_id=None,
         knowledge_file=None,
         propose_change_topic=None,
+        supersedes=supersedes,
     )
 
 
@@ -276,20 +288,27 @@ def test_read_memos_bad_enum_disposition_raises(tmp_path: Path) -> None:
     assert "disposition" in excinfo.value.detail
 
 
-def test_materialize_work_items_latest_wins(tmp_path: Path) -> None:
+def test_materialize_work_items_supersession_head_wins(tmp_path: Path) -> None:
+    """The chain head wins even when it physically precedes the record it amends."""
     path = tmp_path / "work-items.jsonl"
     first = _minimal_work_item(id_="li-a", status="open")
-    second = _minimal_work_item(id_="li-a", status="closed", resolution="completed")
+    second = _minimal_work_item(
+        id_="li-a",
+        status="closed",
+        resolution="completed",
+        supersedes=work_item_record_identity(item=first),
+    )
     other = _minimal_work_item(id_="li-b")
-    append_work_item(path=path, item=first)
     append_work_item(path=path, item=second)
+    append_work_item(path=path, item=first)
     append_work_item(path=path, item=other)
     materialized = materialize_work_items(read_work_items(path=path))
     assert materialized["li-a"].status == "closed"
     assert materialized["li-b"].status == "open"
 
 
-def test_materialize_memos_latest_wins(tmp_path: Path) -> None:
+def test_materialize_memos_supersession_head_wins(tmp_path: Path) -> None:
+    """The memo chain head wins even when it physically precedes its target."""
     path = tmp_path / "memos.jsonl"
     first = _minimal_memo(id_="mm-a", state="untriaged")
     second = Memo(
@@ -301,9 +320,10 @@ def test_materialize_memos_latest_wins(tmp_path: Path) -> None:
         work_item_id=None,
         knowledge_file=None,
         propose_change_topic=None,
+        supersedes=memo_record_identity(memo=first),
     )
-    append_memo(path=path, memo=first)
     append_memo(path=path, memo=second)
+    append_memo(path=path, memo=first)
     materialized = materialize_memos(read_memos(path=path))
     assert materialized["mm-a"].state == "dispositioned"
 
@@ -714,3 +734,387 @@ def test_read_audit_without_pr_number_key_defaults_to_none(tmp_path: Path) -> No
     assert read_back.audit is not None
     assert read_back.audit.merge_sha == "abc123"
     assert read_back.audit.pr_number is None
+
+
+# -- supersedes field + order-independent reduction (v008 append-only-
+#    store disciplines; contracts.md "Work-items JSONL record schema" ->
+#    supersedes, "Memos JSONL record schema" -> supersedes,
+#    "Materialized view", "Append-only store disciplines") --------------
+
+
+def _sha256_identity_of(*, canonical: str) -> str:
+    """The expected identity encoding: sha256 over canonical line bytes."""
+    return f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
+def test_work_item_default_supersedes_is_none() -> None:
+    """WorkItem defaults the sixteenth key to None (an original record)."""
+    item = WorkItem(
+        id="li-orig01",
+        type="task",
+        status="open",
+        title="t",
+        description="d",
+        origin="freeform",
+        gap_id=None,
+        priority=2,
+        assignee=None,
+        depends_on=(),
+        captured_at="2026-05-19T00:00:00Z",
+        resolution=None,
+        reason=None,
+        audit=None,
+        superseded_by=None,
+    )
+    assert item.supersedes is None
+
+
+def test_memo_default_supersedes_is_none() -> None:
+    """Memo defaults the supersedes key to None (an original record)."""
+    memo = Memo(
+        id="mm-orig01",
+        text="x",
+        state="untriaged",
+        disposition=None,
+        captured_at="2026-05-19T00:00:00Z",
+        work_item_id=None,
+        knowledge_file=None,
+        propose_change_topic=None,
+    )
+    assert memo.supersedes is None
+
+
+def test_append_work_item_writes_supersedes_null(tmp_path: Path) -> None:
+    """Required-on-write: the key is serialized explicitly, null on omission."""
+    path = tmp_path / "work-items.jsonl"
+    append_work_item(path=path, item=_minimal_work_item())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert "supersedes" in payload
+    assert payload["supersedes"] is None
+
+
+def test_append_memo_writes_supersedes_null(tmp_path: Path) -> None:
+    """Required-on-write for memos: the key is serialized explicitly."""
+    path = tmp_path / "memos.jsonl"
+    append_memo(path=path, memo=_minimal_memo())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert "supersedes" in payload
+    assert payload["supersedes"] is None
+
+
+def test_append_work_item_with_supersedes_roundtrips(tmp_path: Path) -> None:
+    """An amendment carrying its target's identity round-trips losslessly."""
+    path = tmp_path / "work-items.jsonl"
+    original = _minimal_work_item(id_="li-amend1")
+    amendment = _minimal_work_item(
+        id_="li-amend1",
+        status="in_progress",
+        captured_at="2026-05-19T01:00:00Z",
+        supersedes=work_item_record_identity(item=original),
+    )
+    append_work_item(path=path, item=original)
+    append_work_item(path=path, item=amendment)
+    read_back = list(read_work_items(path=path))
+    assert read_back == [original, amendment]
+    assert read_back[1].supersedes == work_item_record_identity(item=original)
+
+
+def test_append_memo_with_supersedes_roundtrips(tmp_path: Path) -> None:
+    """A memo amendment carrying its target's identity round-trips losslessly."""
+    path = tmp_path / "memos.jsonl"
+    original = _minimal_memo(id_="mm-amend1")
+    amendment = _minimal_memo(
+        id_="mm-amend1",
+        state="dispositioned",
+        disposition="discard",
+        captured_at="2026-05-19T01:00:00Z",
+        supersedes=memo_record_identity(memo=original),
+    )
+    append_memo(path=path, memo=original)
+    append_memo(path=path, memo=amendment)
+    read_back = list(read_memos(path=path))
+    assert read_back == [original, amendment]
+    assert read_back[1].supersedes == memo_record_identity(memo=original)
+
+
+def test_read_legacy_work_item_without_supersedes_defaults_to_none(tmp_path: Path) -> None:
+    """Optional-on-read: records authored before the field parse cleanly."""
+    path = tmp_path / "work-items.jsonl"
+    legacy_payload = {
+        "id": "li-legacy2",
+        "type": "task",
+        "status": "open",
+        "title": "legacy",
+        "description": "from before supersedes landed",
+        "origin": "freeform",
+        "gap_id": None,
+        "priority": 2,
+        "assignee": None,
+        "depends_on": [],
+        "captured_at": "2026-05-19T00:00:00Z",
+        "resolution": None,
+        "reason": None,
+        "audit": None,
+        "superseded_by": None,
+        "spec_commitment_hint": None,
+    }
+    _ = path.write_text(json.dumps(legacy_payload) + "\n", encoding="utf-8")
+    [read_back] = list(read_work_items(path=path))
+    assert read_back.supersedes is None
+
+
+def test_read_legacy_memo_without_supersedes_defaults_to_none(tmp_path: Path) -> None:
+    """Optional-on-read for memos: pre-field records parse cleanly."""
+    path = tmp_path / "memos.jsonl"
+    legacy_payload = {
+        "id": "mm-legacy1",
+        "text": "from before supersedes landed",
+        "state": "untriaged",
+        "disposition": None,
+        "captured_at": "2026-05-19T00:00:00Z",
+        "work_item_id": None,
+        "knowledge_file": None,
+        "propose_change_topic": None,
+    }
+    _ = path.write_text(json.dumps(legacy_payload) + "\n", encoding="utf-8")
+    [read_back] = list(read_memos(path=path))
+    assert read_back.supersedes is None
+
+
+def test_read_work_item_with_non_string_supersedes_raises(tmp_path: Path) -> None:
+    """A non-string non-null supersedes value fires SchemaViolationError."""
+    path = tmp_path / "work-items.jsonl"
+    append_work_item(path=path, item=_minimal_work_item())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["supersedes"] = 42
+    _ = path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    with pytest.raises(SchemaViolationError) as excinfo:
+        list(read_work_items(path=path))
+    assert "supersedes" in excinfo.value.detail
+
+
+def test_read_memo_with_non_string_supersedes_raises(tmp_path: Path) -> None:
+    """A non-string non-null memo supersedes value fires SchemaViolationError."""
+    path = tmp_path / "memos.jsonl"
+    append_memo(path=path, memo=_minimal_memo())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["supersedes"] = 42
+    _ = path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    with pytest.raises(SchemaViolationError) as excinfo:
+        list(read_memos(path=path))
+    assert "supersedes" in excinfo.value.detail
+
+
+def test_append_work_item_rejects_non_string_supersedes(tmp_path: Path) -> None:
+    """The append-side validator rejects a non-string supersedes payload."""
+    path = tmp_path / "work-items.jsonl"
+    bad = _minimal_work_item(supersedes=42)  # type: ignore[arg-type]
+    with pytest.raises(SchemaViolationError) as excinfo:
+        append_work_item(path=path, item=bad)
+    assert "supersedes" in excinfo.value.detail
+
+
+def test_append_memo_rejects_non_string_supersedes(tmp_path: Path) -> None:
+    """The memo append-side validator rejects a non-string supersedes payload."""
+    path = tmp_path / "memos.jsonl"
+    bad = _minimal_memo(supersedes=42)  # type: ignore[arg-type]
+    with pytest.raises(SchemaViolationError) as excinfo:
+        append_memo(path=path, memo=bad)
+    assert "supersedes" in excinfo.value.detail
+
+
+def test_work_item_record_identity_is_sha256_of_canonical_line(tmp_path: Path) -> None:
+    """The fixed identity encoding: sha256 over the canonical line bytes.
+
+    The append path writes the canonical serialization (every schema key
+    explicit, sorted keys, compact separators), so a record's identity is
+    exactly the sha256 of its own line, sans trailing newline.
+    """
+    path = tmp_path / "work-items.jsonl"
+    item = _minimal_work_item()
+    append_work_item(path=path, item=item)
+    line = path.read_text(encoding="utf-8").rstrip("\n")
+    assert work_item_record_identity(item=item) == _sha256_identity_of(canonical=line)
+
+
+def test_memo_record_identity_is_sha256_of_canonical_line(tmp_path: Path) -> None:
+    """The memo identity is the sha256 of its canonical line bytes."""
+    path = tmp_path / "memos.jsonl"
+    memo = _minimal_memo()
+    append_memo(path=path, memo=memo)
+    line = path.read_text(encoding="utf-8").rstrip("\n")
+    assert memo_record_identity(memo=memo) == _sha256_identity_of(canonical=line)
+
+
+def test_work_item_record_identity_normalizes_legacy_records(tmp_path: Path) -> None:
+    """A legacy record's identity is computed over its normalized form.
+
+    Records on disk that pre-date the optional keys hash as if those keys
+    were explicit nulls, so identity stays a pure function of record
+    content regardless of which schema era serialized it.
+    """
+    path = tmp_path / "work-items.jsonl"
+    legacy_payload = {
+        "id": "li-legacy3",
+        "type": "task",
+        "status": "open",
+        "title": "legacy",
+        "description": "pre-optional-keys record",
+        "origin": "freeform",
+        "gap_id": None,
+        "priority": 2,
+        "assignee": None,
+        "depends_on": [],
+        "captured_at": "2026-05-19T00:00:00Z",
+        "resolution": None,
+        "reason": None,
+        "audit": None,
+        "superseded_by": None,
+    }
+    _ = path.write_text(json.dumps(legacy_payload) + "\n", encoding="utf-8")
+    [read_back] = list(read_work_items(path=path))
+    normalized = dict(legacy_payload)
+    normalized["spec_commitment_hint"] = None
+    normalized["supersedes"] = None
+    canonical = json.dumps(normalized, separators=(",", ":"), sort_keys=True)
+    assert work_item_record_identity(item=read_back) == _sha256_identity_of(canonical=canonical)
+
+
+def test_record_identity_covers_the_supersedes_pointer() -> None:
+    """Records differing only in supersedes have distinct identities.
+
+    The pointer participates in the hashed content, so supersession
+    chains are hash chains — an amendment cannot be confused with the
+    original it amends.
+    """
+    base = _minimal_work_item(id_="li-chain1")
+    amendment = _minimal_work_item(
+        id_="li-chain1",
+        supersedes=work_item_record_identity(item=base),
+    )
+    assert work_item_record_identity(item=base) != work_item_record_identity(item=amendment)
+
+
+def test_materialize_work_items_is_order_independent(tmp_path: Path) -> None:
+    """The chain head wins under every physical record permutation.
+
+    All three records share captured_at, so only the supersedes
+    pointers — never file order, never the tie-break — determine the
+    head. This retires the DEPRECATED "latest record by file order
+    wins" reduction.
+    """
+    a = _minimal_work_item(id_="li-chain2", status="open")
+    b = _minimal_work_item(
+        id_="li-chain2",
+        status="in_progress",
+        supersedes=work_item_record_identity(item=a),
+    )
+    c = _minimal_work_item(
+        id_="li-chain2",
+        status="blocked",
+        supersedes=work_item_record_identity(item=b),
+    )
+    for index, ordering in enumerate(permutations((a, b, c))):
+        path = tmp_path / f"work-items-{index}.jsonl"
+        for record in ordering:
+            append_work_item(path=path, item=record)
+        materialized = materialize_work_items(read_work_items(path=path))
+        assert materialized == {"li-chain2": c}
+
+
+def test_materialize_memos_is_order_independent(tmp_path: Path) -> None:
+    """The memo chain head wins under both physical record orders."""
+    first = _minimal_memo(id_="mm-chain1")
+    second = _minimal_memo(
+        id_="mm-chain1",
+        state="dispositioned",
+        disposition="discard",
+        supersedes=memo_record_identity(memo=first),
+    )
+    for index, ordering in enumerate(permutations((first, second))):
+        path = tmp_path / f"memos-{index}.jsonl"
+        for record in ordering:
+            append_memo(path=path, memo=record)
+        assert materialize_memos(read_memos(path=path)) == {"mm-chain1": second}
+
+
+def test_materialize_work_items_divergence_tie_breaks_on_captured_at(tmp_path: Path) -> None:
+    """Divergent heads materialize to the latest-captured record."""
+    earlier = _minimal_work_item(id_="li-div1", status="open")
+    later = _minimal_work_item(
+        id_="li-div1",
+        status="in_progress",
+        captured_at="2026-05-19T02:00:00Z",
+    )
+    for index, ordering in enumerate(permutations((earlier, later))):
+        path = tmp_path / f"work-items-{index}.jsonl"
+        for record in ordering:
+            append_work_item(path=path, item=record)
+        assert materialize_work_items(read_work_items(path=path)) == {"li-div1": later}
+
+
+def test_materialize_work_items_divergence_tie_breaks_on_identity(tmp_path: Path) -> None:
+    """Equal captured_at falls through to the per-record identity tie-break."""
+    one = _minimal_work_item(id_="li-div2", status="open")
+    two = _minimal_work_item(id_="li-div2", status="in_progress")
+    ranked = sorted((work_item_record_identity(item=record), record) for record in (one, two))
+    expected = ranked[-1][1]
+    for index, ordering in enumerate(permutations((one, two))):
+        path = tmp_path / f"work-items-{index}.jsonl"
+        for record in ordering:
+            append_work_item(path=path, item=record)
+        assert materialize_work_items(read_work_items(path=path)) == {"li-div2": expected}
+
+
+def test_reduce_work_item_heads_surfaces_divergence(tmp_path: Path) -> None:
+    """Concurrent divergence is detectable: every un-superseded head is returned.
+
+    Two amendments of one base record (neither superseding the other)
+    both surface, in tie-break order; the superseded base does not. A
+    chain-free entity reduces to its single head.
+    """
+    path = tmp_path / "work-items.jsonl"
+    base = _minimal_work_item(id_="li-div3", status="open")
+    left = _minimal_work_item(
+        id_="li-div3",
+        status="in_progress",
+        captured_at="2026-05-19T01:00:00Z",
+        supersedes=work_item_record_identity(item=base),
+    )
+    right = _minimal_work_item(
+        id_="li-div3",
+        status="blocked",
+        captured_at="2026-05-19T02:00:00Z",
+        supersedes=work_item_record_identity(item=base),
+    )
+    single = _minimal_work_item(id_="li-sing1")
+    for record in (base, left, right, single):
+        append_work_item(path=path, item=record)
+    heads = reduce_work_item_heads(records=read_work_items(path=path))
+    assert heads == {"li-div3": (left, right), "li-sing1": (single,)}
+
+
+def test_reduce_memo_heads_surfaces_divergence(tmp_path: Path) -> None:
+    """Divergent memo heads both surface, in tie-break order."""
+    path = tmp_path / "memos.jsonl"
+    one = _minimal_memo(id_="mm-div1")
+    two = _minimal_memo(id_="mm-div1", captured_at="2026-05-19T01:00:00Z")
+    append_memo(path=path, memo=one)
+    append_memo(path=path, memo=two)
+    heads = reduce_memo_heads(records=read_memos(path=path))
+    assert heads == {"mm-div1": (one, two)}
+
+
+def test_reduce_work_item_heads_collapses_identical_lines(tmp_path: Path) -> None:
+    """A line duplicated by a merge=union merge collapses to one head.
+
+    Identical records share an identity, so the reduction dedupes them
+    instead of reporting false divergence.
+    """
+    path = tmp_path / "work-items.jsonl"
+    item = _minimal_work_item(id_="li-dup1")
+    append_work_item(path=path, item=item)
+    line = path.read_text(encoding="utf-8")
+    _ = path.write_text(line + line, encoding="utf-8")
+    heads = reduce_work_item_heads(records=read_work_items(path=path))
+    assert heads == {"li-dup1": (item,)}

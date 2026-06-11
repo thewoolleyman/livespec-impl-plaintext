@@ -1,9 +1,13 @@
 """JSONL store primitives for work-items and memos.
 
 Per SPECIFICATION/contracts.md §"Work-items JSONL record schema" /
-§"Memos JSONL record schema" and SPECIFICATION/constraints.md §"JSONL
-substrate constraints", the store is append-only at the write boundary
-and the materialized view is the LAST record per `id`.
+§"Memos JSONL record schema" / §"Materialized view" / §"Append-only
+store disciplines", the store is append-only at the write boundary and
+the materialized view of an entity is its supersession-chain head,
+computed from the in-record `supersedes` pointers independently of the
+physical order of records in the file (git may reorder lines during a
+merge; the legacy "latest record by file order wins" reduction is
+retired).
 
 Public API:
 
@@ -12,8 +16,24 @@ Public API:
 - `read_memos(*, path)` — stream Memo records (analogous).
 - `append_work_item(*, path, item)` / `append_memo(*, path, memo)` —
   write a new record line.
+- `work_item_record_identity(*, item)` / `memo_record_identity(*,
+  memo)` — the stable per-record identity: `sha256:<hex-digest>` over
+  the record's canonical serialization (every schema key explicit,
+  sorted keys, compact separators — exactly the line bytes the append
+  path writes, without the trailing newline). Derivable from record
+  content alone; the value a superseding record carries in its
+  `supersedes` key.
+- `reduce_work_item_heads(*, records)` / `reduce_memo_heads(*,
+  records)` — the canonical order-independent reduction: per entity
+  `id`, every record whose identity no sibling record's `supersedes`
+  names, ordered ascending by the deterministic tie-break
+  (`captured_at`, then per-record identity). Identical records (equal
+  identity — e.g. a line duplicated by a `merge=union` merge)
+  collapse to one. More than one head for an `id` is concurrent
+  divergence, surfaced for detection rather than silently resolved.
 - `materialize_work_items(records)` / `materialize_memos(records)` —
-  reduce a stream to the latest-record-per-id dict.
+  reduce a stream to the current-head-per-id dict (the tie-break
+  winner among each entity's heads).
 
 The reader functions validate every record against the schema; a
 violation raises SchemaViolationError carrying the offending line
@@ -21,11 +41,12 @@ number. A non-JSON line raises MalformedRecordLineError. Both are
 EXPECTED errors per the Result-vs-bugs split.
 """
 
+import hashlib
 import json
 from collections.abc import Iterator
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, get_args
+from typing import Any, Protocol, TypeVar, get_args
 
 from livespec_impl_git_jsonl.errors import (
     MalformedRecordLineError,
@@ -67,8 +88,9 @@ _WORK_ITEM_REQUIRED_KEYS = frozenset(
 # OPTIONAL work-item keys: present in records authored after their
 # introduction; missing in legacy records pre-dating their landing.
 # Read path treats absence as `None`; write path always serializes
-# (per livespec PC #4 sub-proposal 3 — `spec_commitment_hint`).
-_WORK_ITEM_OPTIONAL_KEYS = frozenset({"spec_commitment_hint"})
+# (per livespec PC #4 sub-proposal 3 — `spec_commitment_hint` — and
+# the v008 append-only-store disciplines — `supersedes`).
+_WORK_ITEM_OPTIONAL_KEYS = frozenset({"spec_commitment_hint", "supersedes"})
 
 _WORK_ITEM_ALLOWED_KEYS = _WORK_ITEM_REQUIRED_KEYS | _WORK_ITEM_OPTIONAL_KEYS
 
@@ -84,6 +106,26 @@ _MEMO_REQUIRED_KEYS = frozenset(
         "propose_change_topic",
     }
 )
+
+# OPTIONAL memo keys: same required-on-write / optional-on-read
+# treatment as the work-item optional keys.
+_MEMO_OPTIONAL_KEYS = frozenset({"supersedes"})
+
+
+class _SupersedableRecord(Protocol):
+    """Structural shape the canonical head reduction consumes."""
+
+    @property
+    def id(self) -> str: ...
+
+    @property
+    def captured_at(self) -> str: ...
+
+    @property
+    def supersedes(self) -> str | None: ...
+
+
+_RecordT = TypeVar("_RecordT", bound=_SupersedableRecord)
 
 
 def read_work_items(*, path: Path) -> Iterator[WorkItem]:
@@ -125,14 +167,89 @@ def append_memo(*, path: Path, memo: Memo) -> None:
     _append_record(path=path, payload=payload)
 
 
+def work_item_record_identity(*, item: WorkItem) -> str:
+    """Return the stable per-record identity of a work-item record.
+
+    `sha256:<hex-digest>` over the record's canonical serialization
+    (all sixteen schema keys explicit, sorted, compact separators).
+    Legacy records read back from disk without the optional keys
+    normalize to the same canonical form, so the identity is a pure
+    function of record content — no file positions, no external state.
+    """
+    return _record_identity(payload=_work_item_to_dict(item=item))
+
+
+def memo_record_identity(*, memo: Memo) -> str:
+    """Return the stable per-record identity of a memo record."""
+    return _record_identity(payload=_memo_to_dict(memo=memo))
+
+
+def reduce_work_item_heads(*, records: Iterator[WorkItem]) -> dict[str, tuple[WorkItem, ...]]:
+    """Reduce a WorkItem stream to the un-superseded heads per `id`.
+
+    The canonical order-independent reduction per
+    SPECIFICATION/contracts.md §"Materialized view": each entity's
+    heads are the records whose identity no sibling record's
+    `supersedes` pointer names, in ascending tie-break order
+    (`captured_at`, then per-record identity). A tuple longer than one
+    is concurrent divergence — representable and detectable, never
+    silently resolved here.
+    """
+    entries = ((work_item_record_identity(item=record), record) for record in records)
+    return _reduce_heads(entries=entries)
+
+
+def reduce_memo_heads(*, records: Iterator[Memo]) -> dict[str, tuple[Memo, ...]]:
+    """Reduce a Memo stream to the un-superseded heads per `id`."""
+    entries = ((memo_record_identity(memo=record), record) for record in records)
+    return _reduce_heads(entries=entries)
+
+
 def materialize_work_items(records: Iterator[WorkItem]) -> dict[str, WorkItem]:
-    """Reduce a WorkItem stream to the latest-record-per-id dict."""
-    return {record.id: record for record in records}
+    """Reduce a WorkItem stream to the current-head-per-id dict.
+
+    The current head is the supersession-chain head; when an entity
+    has divergent heads the deterministic tie-break winner (greatest
+    `captured_at`, then greatest per-record identity) is returned.
+    Consumers that must DETECT divergence consume
+    `reduce_work_item_heads` directly.
+    """
+    return {
+        entity_id: heads[-1] for entity_id, heads in reduce_work_item_heads(records=records).items()
+    }
 
 
 def materialize_memos(records: Iterator[Memo]) -> dict[str, Memo]:
-    """Reduce a Memo stream to the latest-record-per-id dict."""
-    return {record.id: record for record in records}
+    """Reduce a Memo stream to the current-head-per-id dict."""
+    return {entity_id: heads[-1] for entity_id, heads in reduce_memo_heads(records=records).items()}
+
+
+def _record_identity(*, payload: dict[str, Any]) -> str:
+    canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _reduce_heads(
+    *,
+    entries: Iterator[tuple[str, _RecordT]],
+) -> dict[str, tuple[_RecordT, ...]]:
+    groups: dict[str, dict[str, _RecordT]] = {}
+    for identity, record in entries:
+        groups.setdefault(record.id, {})[identity] = record
+    heads: dict[str, tuple[_RecordT, ...]] = {}
+    for entity_id, group in groups.items():
+        superseded = frozenset(
+            record.supersedes for record in group.values() if record.supersedes is not None
+        )
+        unsuperseded = {
+            identity: record for identity, record in group.items() if identity not in superseded
+        }
+        tie_break_order = sorted(
+            (record.captured_at, identity) for identity, record in unsuperseded.items()
+        )
+        heads[entity_id] = tuple(unsuperseded[identity] for _, identity in tie_break_order)
+    return heads
 
 
 def _iter_records(*, path: Path) -> Iterator[tuple[int, dict[str, Any]]]:
@@ -232,17 +349,18 @@ def _validate_work_item_payload(
             line_number=line_number,
             parsed=audit_value,
         )
-    if "spec_commitment_hint" in parsed:
-        hint_value = parsed["spec_commitment_hint"]
-        if hint_value is not None and not isinstance(hint_value, str):
-            raise SchemaViolationError(
-                path=path,
-                line_number=line_number,
-                detail=(
-                    f"field 'spec_commitment_hint' must be string or null, "
-                    f"got {type(hint_value).__name__}"
-                ),
-            )
+    _check_optional_string_key(
+        path=path,
+        line_number=line_number,
+        parsed=parsed,
+        key="spec_commitment_hint",
+    )
+    _check_optional_string_key(
+        path=path,
+        line_number=line_number,
+        parsed=parsed,
+        key="supersedes",
+    )
 
 
 def _parse_work_item(*, path: Path, line_number: int, parsed: dict[str, Any]) -> WorkItem:
@@ -270,6 +388,7 @@ def _parse_work_item(*, path: Path, line_number: int, parsed: dict[str, Any]) ->
         audit=audit_record,
         superseded_by=parsed["superseded_by"],
         spec_commitment_hint=parsed.get("spec_commitment_hint"),
+        supersedes=parsed.get("supersedes"),
     )
 
 
@@ -343,6 +462,7 @@ def _validate_memo_payload(
         line_number=line_number,
         parsed=parsed,
         required=_MEMO_REQUIRED_KEYS,
+        optional=_MEMO_OPTIONAL_KEYS,
     )
     _check_in_enum(
         path=path,
@@ -360,6 +480,12 @@ def _validate_memo_payload(
             value=disposition_value,
             allowed=get_args(Disposition),
         )
+    _check_optional_string_key(
+        path=path,
+        line_number=line_number,
+        parsed=parsed,
+        key="supersedes",
+    )
 
 
 def _parse_memo(*, path: Path, line_number: int, parsed: dict[str, Any]) -> Memo:
@@ -373,6 +499,7 @@ def _parse_memo(*, path: Path, line_number: int, parsed: dict[str, Any]) -> Memo
         work_item_id=parsed["work_item_id"],
         knowledge_file=parsed["knowledge_file"],
         propose_change_topic=parsed["propose_change_topic"],
+        supersedes=parsed.get("supersedes"),
     )
 
 
@@ -410,6 +537,25 @@ def _check_required_keys(
             path=path,
             line_number=line_number,
             detail=f"unexpected extra keys: {sorted(extra)}",
+        )
+
+
+def _check_optional_string_key(
+    *,
+    path: Path,
+    line_number: int,
+    parsed: dict[str, Any],
+    key: str,
+) -> None:
+    """Verify an optional-on-read key, when present, is string or null."""
+    if key not in parsed:
+        return
+    value = parsed[key]
+    if value is not None and not isinstance(value, str):
+        raise SchemaViolationError(
+            path=path,
+            line_number=line_number,
+            detail=(f"field {key!r} must be string or null, got {type(value).__name__}"),
         )
 
 

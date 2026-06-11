@@ -71,6 +71,15 @@ class WorkItem:
     `None` (no in-place migration required); the field is OPTIONAL on
     the read path but always written explicitly on append (as `null`
     or the value).
+
+    `supersedes` is the append-only supersession pointer (the sixteenth
+    schema key, per SPECIFICATION/contracts.md "Work-items JSONL record
+    schema" -> supersedes and "Append-only store disciplines"). `None`
+    marks an original record; a non-None value carries the stable
+    per-record identity (`store.work_item_record_identity`) of the
+    single prior record this record amends. Required-on-write,
+    optional-on-read with the same legacy-record treatment as
+    `spec_commitment_hint`.
     """
 
     id: str
@@ -89,11 +98,20 @@ class WorkItem:
     audit: AuditRecord | None
     superseded_by: str | None
     spec_commitment_hint: str | None = None
+    supersedes: str | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
 class Memo:
-    """A single JSONL memo record (one line of the memos file)."""
+    """A single JSONL memo record (one line of the memos file).
+
+    `supersedes` carries the same append-only supersession-pointer
+    semantics as the work-items schema's key (per
+    SPECIFICATION/contracts.md "Memos JSONL record schema" ->
+    supersedes): required-on-write, optional-on-read, `None` for an
+    original record, the stable per-record identity
+    (`store.memo_record_identity`) of the amended record otherwise.
+    """
 
     id: str
     text: str
@@ -103,6 +121,7 @@ class Memo:
     work_item_id: str | None
     knowledge_file: str | None
     propose_change_topic: str | None
+    supersedes: str | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
